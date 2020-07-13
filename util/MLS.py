@@ -6,6 +6,7 @@ import numpy as np
 
 from PIL import Image
 
+
 def read_points(filename):
     points = []
     for line in open(filename):
@@ -15,7 +16,7 @@ def read_points(filename):
     return points
 
 
-class MLS():
+class MLS:
     def __init__(self, step=15, v_class=np.int32):
         self.step = step
         self.v_class = v_class  # The type of vxy, can be np.float32, np.int32
@@ -156,6 +157,7 @@ class MLS():
         vxy: The offset of point with shape (w, h, 2)
             For the point (x, y) in original image, the warped point location is [x + vxy(x, y, 0), y + vxy[x, y, 1]]
         """
+
     def run_MLS(self, image, points_start, points_end, padding=30):
         if np.ndim(image) == 4:
             img = np.pad(image.squeeze(0), ((padding, padding), (padding, padding), (0, 0)), 'symmetric')
@@ -184,7 +186,7 @@ class MLS():
         warp_BtoA, vxy_BtoA = mls_util.run_MLS(img_B, points_B, points_A)
         warp_BtoM, vxy_BtoM = mls_util.run_MLS(img_B, points_B, points_middle)
 
-        np.save('%s/AtoB.npy' % root_folder,vxy_AtoB)
+        np.save('%s/AtoB.npy' % root_folder, vxy_AtoB)
         plt.imsave('%s/warp_AtoM.png' % root_folder, warp_AtoM)
         np.save('%s/BtoA.npy' % root_folder, vxy_BtoA)
         plt.imsave('%s/warp_BtoM.png' % root_folder, warp_BtoM)
