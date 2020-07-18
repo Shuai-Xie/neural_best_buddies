@@ -1,3 +1,23 @@
+# Test on cross-domain Aerial images
+
+- imageSize: 448 × 448
+- infer time: 588.2 s
+
+<table>
+<tr>
+<th>Satellite Map</th>
+<th>Colored Segmentation Label</th>
+</tr>
+<tr>
+<td><img src="./results/sat2label_large/A_level_0_top_5.png"/></td>
+<td><img src="./results/sat2label_large/B_level_0_top_5.png"/></td>
+</tr>
+</table>
+
+
+
+---
+
 # Neural Best-Buddies in PyTorch
 
 This is our PyTorch implementation for the Neural-Best Buddies paper.
