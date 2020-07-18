@@ -27,6 +27,8 @@ class vgg19(nn.Module):
         :param opt:
         """
         super(vgg19, self).__init__()
+
+        # model
         self.layer_1 = self.make_layers(basic_model, 0, 2)
         self.layer_2 = self.make_layers(basic_model, 2, 7)
         self.layer_3 = self.make_layers(basic_model, 7, 12)
@@ -34,24 +36,27 @@ class vgg19(nn.Module):
         self.layer_5 = self.make_layers(basic_model, 21, 30)
         self.layers = [self.layer_1, self.layer_2, self.layer_3, self.layer_4, self.layer_5]
 
+        # opt
         image_height = image_width = opt.imageSize
         self.Tensor = torch.cuda.FloatTensor if opt.gpu_ids else torch.Tensor
-        self.input = self.Tensor(opt.batchSize, opt.input_nc, image_height, image_width)
-        self.convergence_threshold = opt.convergence_threshold
-        self.old_lr = opt.lr
-        self.beta = opt.beta1
+        self.input = self.Tensor(opt.batchSize, opt.input_nc, image_height, image_width)  # (1,3,224,224)
+        self.convergence_threshold = opt.convergence_threshold  # 0.001
+        self.old_lr = opt.lr  # 0.05
+        self.beta = opt.beta1  # 0.5
 
     def make_layers(self, basic_model, start_layer, end_layer):
         """
         从 basic_model 按照 [start_layer, end_layer) 截取得到对应的 layer
+        end_layer 所在位置 对应原始网络 每个 layer 首层 conv 的输出，即获取特定位置的 feature map
         """
         layer = []
-        features = next(basic_model.children())
+        features = next(basic_model.children())  # 获取到 VGG.features 即 FC 层之前
         original_layer_number = 0
         for module in features.children():
             if start_layer <= original_layer_number < end_layer:
                 layer += [module]
             original_layer_number += 1
+        # print(layer)
         return nn.Sequential(*layer)
 
     def make_classifier_layer(self, old_classifier, dropout_layers):
@@ -71,12 +76,14 @@ class vgg19(nn.Module):
 
     def forward(self, level=6, start_level=0, set_as_var=True):
         assert (level >= start_level)
-        if set_as_var == True:
+        if set_as_var:
             self.input_sample = Variable(self.input)
         else:
             self.input_sample = self.input
 
         layer_i_output = layer_i_input = self.input_sample
+
+        # 可能存在 每个 level 输出，浅层需要重复推理
         for i in range(start_level, level):
             layer_i = self.layers[i]
             layer_i_output = layer_i(layer_i_input)

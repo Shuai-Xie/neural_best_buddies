@@ -13,22 +13,22 @@ import torchvision.transforms as transforms
 import collections
 
 
+def get_transform(width):  # img width
+    transform_list = [
+        transforms.Resize([width, width], Image.BICUBIC),  # resize PIL
+        transforms.ToTensor(),  # PIL -> tensor
+        transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                             std=[0.229, 0.224, 0.225])
+    ]
+    return transforms.Compose(transform_list)
+
+
 # Converts a Tensor into a Numpy array
 # |imtype|: the desired type of the converted numpy array
-def read_image(path, witdh):
+def read_image(path, width):
     I = Image.open(path).convert('RGB')
-    transform = get_transform(witdh)
-    return transform(I).unsqueeze(0)
-
-
-def get_transform(witdh):
-    transform_list = []
-    osize = [witdh, witdh]
-    transform_list.append(transforms.Resize(osize, Image.BICUBIC))
-    transform_list += [transforms.ToTensor(),
-                       transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                            std=[0.229, 0.224, 0.225])]
-    return transforms.Compose(transform_list)
+    transform = get_transform(width)
+    return transform(I).unsqueeze(0)  # [1,3,224,224]
 
 
 def save_final_image(image, name, save_dir):

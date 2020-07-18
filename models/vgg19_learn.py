@@ -74,6 +74,7 @@ def make_layers(cfg, batch_norm=False):
     return nn.Sequential(*layers)
 
 
+# 不同 arch 区别主要在 layer [3,4,5] stacked 的 conv 数量
 cfgs = {
     'A': [
         64, 'M',
@@ -204,3 +205,15 @@ def vgg19_bn(pretrained=False, progress=True, **kwargs):
         progress (bool): If True, displays a progress bar of the download to stderr
     """
     return _vgg('vgg19_bn', 'E', True, pretrained, progress, **kwargs)
+
+
+if __name__ == '__main__':
+    base_model = vgg19(pretrained=False)
+    print('children')
+    """对应 VGG class 中 顶层成员变量
+    0   features
+    1   avgpool
+    2   classifier
+    """
+    for i, (name, child) in enumerate(base_model.named_children()):
+        print(i, name, child)

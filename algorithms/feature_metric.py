@@ -21,6 +21,7 @@ def patch_distance(A, B, average=True):
 
 
 def normalize_per_pix(A):
+    # C / √C_i^2
     return A / A.pow(2).sum(1, keepdim=True).pow(0.5).expand_as(A)
 
 
