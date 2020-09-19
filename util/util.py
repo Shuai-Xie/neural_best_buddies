@@ -1,16 +1,14 @@
-from __future__ import print_function
 import torch
-from torch.autograd import Variable
 import numpy as np
 import scipy.io
-from PIL import Image
-import inspect, re
-import numpy as np
+import inspect
+import re
 import os
 import math
 from PIL import Image
 import torchvision.transforms as transforms
 import collections
+import shutil
 
 
 def get_transform(width):  # img width
@@ -54,7 +52,7 @@ def upsample_map(map_values, scale_factor, mode='nearest'):
         return map_values
     else:
         upsampler = torch.nn.Upsample(scale_factor=scale_factor, mode=mode)
-        return upsampler(Variable(map_values)).data
+        return upsampler(map_values).data
 
 
 def downsample_map(map_values, scale_factor):
@@ -63,7 +61,7 @@ def downsample_map(map_values, scale_factor):
     else:
         d = scale_factor
         downsampler = torch.nn.AvgPool2d((d, d), stride=(d, d))
-        return downsampler(Variable(map_values)).data
+        return downsampler(map_values).data
 
 
 def tensor2im(image_tensor, imtype=np.uint8, index=0):
@@ -187,17 +185,10 @@ def print_numpy(x, val=True, shp=False):
             np.mean(x), np.min(x), np.max(x), np.median(x), np.std(x)))
 
 
-def mkdirs(paths):
-    if isinstance(paths, list) and not isinstance(paths, str):
-        for path in paths:
-            mkdir(path)
-    else:
-        mkdir(paths)
-
-
 def mkdir(path):
-    if not os.path.exists(path):
-        os.makedirs(path)
+    if os.path.exists(path):
+        shutil.rmtree(path)
+    os.makedirs(path)
 
 
 def read_mask(path):

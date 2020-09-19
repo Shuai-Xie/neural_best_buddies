@@ -15,7 +15,8 @@ save_dir = os.path.join(opt.results_dir, opt.name)
 nbbs = NBBs.sparse_semantic_correspondence(
     vgg19,
     opt.gpu_ids, opt.tau, opt.border_size, save_dir,
-    opt.k_per_level, opt.k_final, opt.fast
+    opt.k_per_level,
+    opt.k_final, opt.fast
 )
 
 # read tensor img [1,3,224,224]
@@ -25,7 +26,8 @@ A = util.read_image(opt.datarootA, opt.imageSize)
 B = util.read_image(opt.datarootB, opt.imageSize)
 points = nbbs.run(A, B)
 t2 = time.time()
-print('time:', t2 - t1)
+print('time:', t2 - t1)  # 186s
 
+# 读取特征点，完成图像 warp
 mls = MLS.MLS(v_class=np.int32)
 mls.run_MLS_in_folder(root_folder=save_dir)

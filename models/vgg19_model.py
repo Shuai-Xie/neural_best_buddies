@@ -17,27 +17,33 @@ def define_Vgg19(opt):
     if use_gpu:
         assert (torch.cuda.is_available())
         vgg19net.cuda(opt.gpu_ids[0])  # 只用第1块卡
+
     return vgg19net
 
 
 class vgg19(nn.Module):
     def __init__(self, basic_model, opt):
         """
-        :param basic_model: 使用 pretrain 模型
+        :param basic_model: 使用 torchvision pretrain vgg19
         :param opt:
         """
         super(vgg19, self).__init__()
 
         # model
+        # 通过 Sequential layer 数字截取
         self.layer_1 = self.make_layers(basic_model, 0, 2)
         self.layer_2 = self.make_layers(basic_model, 2, 7)
         self.layer_3 = self.make_layers(basic_model, 7, 12)
         self.layer_4 = self.make_layers(basic_model, 12, 21)
         self.layer_5 = self.make_layers(basic_model, 21, 30)
+
+        # 5 层 layer 特征
         self.layers = [self.layer_1, self.layer_2, self.layer_3, self.layer_4, self.layer_5]
+        # channels for each level
+        self.channels = [3, 64, 128, 256, 512, 512]
 
         # opt
-        image_height = image_width = opt.imageSize
+        image_height = image_width = opt.imageSize  # 224
         self.Tensor = torch.cuda.FloatTensor if opt.gpu_ids else torch.Tensor
         self.input = self.Tensor(opt.batchSize, opt.input_nc, image_height, image_width)  # (1,3,224,224)
         self.convergence_threshold = opt.convergence_threshold  # 0.001
@@ -46,7 +52,7 @@ class vgg19(nn.Module):
 
     def make_layers(self, basic_model, start_layer, end_layer):
         """
-        从 basic_model 按照 [start_layer, end_layer) 截取得到对应的 layer
+        从 basic_model 按照 [start_layer, end_layer) 截取得到对应的 layer, 即子模型
         end_layer 所在位置 对应原始网络 每个 layer 首层 conv 的输出，即获取特定位置的 feature map
         """
         layer = []
@@ -67,21 +73,18 @@ class vgg19(nn.Module):
                 classifier_layer += [module]
         return nn.Sequential(*classifier_layer)
 
-    def set_input(self, input_A, set_new_var=True):
-        if set_new_var == True:
-            self.input = self.Tensor(input_A.size())
-            self.input.copy_(input_A)
-        else:
-            self.input = input_A
+    def set_input(self, input_A):
+        self.input = input_A
 
-    def forward(self, level=6, start_level=0, set_as_var=True):
+    def forward(self, level=6, start_level=0):
+        """
+        通过设置 level 来得到不同中间层输出，其实可以使用 hook 一次性拿到所有想要层的特征
+        :param level: 结束 level
+        :param start_level: 起始 level
+        :return:
+        """
         assert (level >= start_level)
-        if set_as_var:
-            self.input_sample = Variable(self.input)
-        else:
-            self.input_sample = self.input
-
-        layer_i_output = layer_i_input = self.input_sample
+        layer_i_output = layer_i_input = self.input
 
         # 可能存在 每个 level 输出，浅层需要重复推理
         for i in range(start_level, level):
@@ -91,31 +94,45 @@ class vgg19(nn.Module):
 
         return layer_i_output
 
-    def deconve(self, features, original_image_width, src_level, dst_level, print_errors=True):
+    def deconv(self, features, original_image_width, src_level, dst_level):
+        """
+        features: warped feature, 作为 src feature，learn L-1 feature
+        original_image_width: 224
+        src_level: L
+        dst_level: L-1
+        print_errors:
+        """
+        # dst feature
+        # 计算 L-1 层特征 size: B,C,H,W
         dst_feature_size = self.get_layer_size(dst_level, batch_size=features.size(0), width=original_image_width)
-        deconvolved_feature = Variable(self.Tensor(dst_feature_size), requires_grad=True)
+        deconvolved_feature = self.Tensor(dst_feature_size)
         deconvolved_feature.data.fill_(0)
+        deconvolved_feature.requires_grad_()  # requires_grad=True
+
         optimizer = torch.optim.Adam([{'params': deconvolved_feature}],
                                      lr=self.old_lr, betas=(self.beta, 0.999))
+        # src feature
+        src_feature_size = self.get_layer_size(src_level, batch_size=features.size(0), width=original_image_width)
+        src_feature = self.Tensor(src_feature_size)  # requires_grad=False
+        src_feature.data.copy_(features)  # copy warped feature
 
-        src_level_size = self.get_layer_size(src_level, batch_size=features.size(0), width=original_image_width)
-        src_layer = Variable(self.Tensor(src_level_size), requires_grad=False)
-        src_layer.data.copy_(features)
+        criterion = nn.MSELoss(reduction='mean')
 
-        error = float('inf')
-        criterionPerceptual = PerceptualLoss(tensor=self.Tensor)
         i = 0
         self.reset_last_losses()
         while self.convergence_criterion() > self.convergence_threshold:
             optimizer.zero_grad()
-            self.set_input(deconvolved_feature, set_new_var=False)
-            deconvolved_feature_forward = self.forward(level=src_level, start_level=dst_level, set_as_var=False)
-            loss_perceptual = criterionPerceptual(deconvolved_feature_forward, src_layer)
+            # init L-1 feature 作为 输入
+            self.set_input(deconvolved_feature)
+            # 使用 [L-1,L] 这一段 layer 作为模型; 没有优化 layer 参数，而是优化 deconvolved_feature
+            deconvolved_feature_forward = self.forward(level=src_level, start_level=dst_level)
+            # loss
+            loss_perceptual = criterion(deconvolved_feature_forward, src_feature)
             loss_perceptual.backward()
-            error = loss_perceptual.data[0] if parse_version(torch.__version__) <= parse_version('0.4.1') else loss_perceptual.data.item()
-            self.update_last_losses(error)
-            if (i % 3 == 0) and (print_errors == True):
-                print("error: ", error)
+            loss = loss_perceptual.item()
+            self.update_last_losses(loss)
+            # if i % 5 == 0:
+            #     print(self.last_losses)
             optimizer.step()
             i += 1
 
@@ -125,27 +142,16 @@ class vgg19(nn.Module):
         self.last_losses = np.array([0, 100, 200, 300, 400, 500])
 
     def update_last_losses(self, loss):
-        self.last_losses = np.delete(self.last_losses, 0)
-        self.last_losses = np.append(self.last_losses, loss)
+        self.last_losses = np.delete(self.last_losses, 0)  # 删除队头
+        self.last_losses = np.append(self.last_losses, loss)  # 加入新的
 
-    def convergence_criterion(self):
+    def convergence_criterion(self):  # 计算 loss 更新均值
         convergence_criterion = np.average(np.abs(np.diff(self.last_losses)))
         return convergence_criterion
 
     def get_layer_size(self, level, batch_size=1, width=224):
-        channels = [3, 64, 128, 256, 512, 512]
         if level == 0:
             width_layer = width
         else:
-            width_layer = int(width / (2 ** int(level - 1)))
-        return torch.Size([batch_size, channels[int(level)], width_layer, width_layer])
-
-
-class PerceptualLoss(nn.Module):
-    def __init__(self, tensor=torch.FloatTensor):
-        super(PerceptualLoss, self).__init__()
-        self.Tensor = tensor
-        self.loss = nn.MSELoss(reduction='mean')
-
-    def __call__(self, input, target_tensor):
-        return self.loss(input, target_tensor)
+            width_layer = int(width / (2 ** int(level - 1)))  # width 下采样
+        return torch.Size([batch_size, self.channels[int(level)], width_layer, width_layer])

@@ -20,17 +20,34 @@ def patch_distance(A, B, average=True):
         return error / tensor_volume
 
 
+# l2-norm, feature vector -> 单位向量
 def normalize_per_pix(A):
-    # C / √C_i^2
-    return A / A.pow(2).sum(1, keepdim=True).pow(0.5).expand_as(A)
+    return A / A.pow(2).sum(1, keepdim=True).pow(0.5).expand_as(A)  # keep_dim 保持 dim1 还在，然后 expand_as(A)
 
 
 def normalize_tensor(A):
     return A / np.power(A.pow(2).sum(), 0.5)
 
 
+def spatial_distance(point_A, point_B):
+    # return (point_A - point_B).pow(2).sum().pow(0.5)
+    return (point_A - point_B).pow(2).sum()  # 判断 d=0, sum 即可
+
+
+# l2-norm, 1,C,H,W -> 1,1,H,W
+def response(F, style='l2'):
+    # F: feature map
+    if style == 'max':
+        [response, indices] = F.max(1, keepdim=True)
+    elif style == 'l2':
+        response = F.pow(2).sum(1, keepdim=True).pow(0.5)  # B,C,H,W; sum(1) L2-norm
+    else:
+        raise ValueError("unknown response style: ", style)
+    return response
+
+
 def stretch_tensor_0_to_1(F):
-    assert (F.dim() == 4)
+    assert (F.dim() == 4)  # F: response 1,1,H,W
     max_val = F.max()
     min_val = F.min()
     if max_val != min_val:
@@ -40,14 +57,14 @@ def stretch_tensor_0_to_1(F):
     return F_normalized
 
 
-def response(F, style='l2'):
-    if style == 'max':
-        [response, indices] = F.max(1, keepdim=True)
-    elif style == 'l2':
-        response = F.pow(2).sum(1, keepdim=True).pow(0.5)
+def FA_to_HA_norm(F):  # l2 + min_max norm
+    F = F.pow(2).sum(1, keepdim=True).pow(0.5)  # B,C,H,W; sum(1) L2-norm
+    min_val, max_val = F.min(), F.max()
+    if max_val != min_val:
+        F_normalized = (F - min_val) / (max_val - min_val)
     else:
-        raise ValueError("unknown response style: ", style)
-    return response
+        F_normalized = F.fill_(0)
+    return F_normalized
 
 
 def mean_channels(F):

@@ -1,131 +1,149 @@
 import os
 import math
 import torch
-import numpy as np
-import torch.nn.functional as functional
-from torch.autograd import Variable
+import torch.nn.functional as F
 from sklearn.cluster import KMeans
 from . import feature_metric as FM
 from util import draw_correspondence as draw
 from util import util
+from pprint import pprint
 
 
 class sparse_semantic_correspondence:
     """稀疏 语义 一致性"""
 
     def __init__(self, model, gpu_ids, tau, border_size, save_dir, k_per_level, k_final, fast):
+        """
+        :param model: vgg19, forward 设置 start/end level 得到中间层特征
+        :param gpu_ids:
+        :param tau: 0.05, 经验值，选择 较优的 NBBs
+        :param border_size:
+        :param save_dir: 中间层 一致性点 保存 dir
+        :param k_per_level: 每层最多搜索的 pts 数量
+        :param k_final:     每层最多保留的 pts 数量
+        :param fast: True 保存到 level 2 截至, 1/2 feature map
+        """
         self.Tensor = torch.cuda.FloatTensor if gpu_ids else torch.Tensor
         self.model = model
-        self.save_dir = save_dir
-        self.border_size = border_size
         self.tau = tau
+        self.border_size = border_size  # 7
+        self.save_dir = save_dir
         self.k_per_level = k_per_level
         self.k_final = k_final
+        self.L_final = 2 if fast else 1  # fast 场景到 level2
+
         # define 5 levels
-        self.patch_size_list = [[5, 5], [5, 5], [3, 3], [3, 3], [3, 3]]
+        self.patch_size_list = [[5, 5], [5, 5], [3, 3], [3, 3], [3, 3]]  # 2*radius -1
         self.search_box_radius_list = [3, 3, 2, 2, 2]
         self.draw_radius = [2, 2, 2, 4, 8]
         self.pad_mode = 'reflect'
-        self.L_final = 2 if fast else 1  # fast 场景到 level2
 
     def find_mapping(self, A, B, patch_size, initial_mapping, search_box_radius):
         """
-        :param A: F_Am_normalized
+        :param A: F_Am_normalized 归一化特征单位向量
         :param B: F_Bm_normalized
         :param patch_size: [3, 3]
-        :param initial_mapping: initial_map_a_to_b, identity_map, 坐标位
+        :param initial_mapping: initial_map_a_to_b, identity_map, 坐标位 [i][j]
         :param search_box_radius: 2
         :return:
         """
-        assert (A.size() == B.size())
         A_to_B_map = self.Tensor(1, 2, A.size(2), A.size(3))
-        # loss_map = self.Tensor(1, 1, A.size(2), A.size(3))
-        # mapping_distance_map = self.Tensor(1, 1, A.size(2), A.size(3))
 
         dx, dy = math.floor(patch_size[0] / 2), math.floor(patch_size[1] / 2)
         pad_size = [dy, dy, dx, dx]
 
-        # pad img
-        A_padded = functional.pad(A, pad_size, self.pad_mode).data
-        B_padded = functional.pad(B, pad_size, self.pad_mode).data
+        # pad img, 考虑边缘
+        A_padded = F.pad(A, pad_size, self.pad_mode)
+        B_padded = F.pad(B, pad_size, self.pad_mode)
 
+        # O(H*W * H*W)
         for i in range(A.size(2)):  # H
             for j in range(A.size(3)):  # W
-                # A 中 一块 区域
+                # patch A
                 candidate_patch_A = A_padded[:, :, i:(i + 2 * dx + 1), j:(j + 2 * dy + 1)]
-                index = self.find_closest_patch_index(
+                index = self.find_closest_patch_index(  # todo: 并行化
                     B_padded,
                     candidate_patch_A,
-                    initial_mapping[0, :, i, j],  # 初始 patch_A 坐标 (x,y); 14*14 尺度
+                    initial_mapping[0, :, i, j],  # (i,j)
                     search_box_radius
                 )
-                # A 的 i,j 对应于 B 中的坐标
+                # A (i,j) 对应于 B (index)
                 A_to_B_map[:, :, i, j] = self.Tensor([index[0] - dx, index[1] - dy])
 
         return A_to_B_map
 
     def find_closest_patch_index(self, B, patch_A, inital_pixel, search_box_radius):
         """
-        :param B: B_padded
+        :param B: B_padded feature
         :param patch_A: patch features C*3*3
-        :param inital_pixel:  initial_mapping[0, :, i, j] -> 坐标
+        :param inital_pixel:  initial_mapping[0, :, i, j] -> 初始 A 的 i,j; 寻找对应 B 上的区域
         :param search_box_radius: 2
         :return:
         """
-        [dx, dy] = [math.floor(patch_A.size(2) / 2), math.floor(patch_A.size(3) / 2)]
-        [search_dx, search_dy] = [search_box_radius, search_box_radius]  # 搜索 radius, 点的半径 所在区域
+        dx, dy = math.floor(patch_A.size(2) / 2), math.floor(patch_A.size(3) / 2)
+        search_dx = search_dy = search_box_radius  # 搜索 radius, 点的半径 所在区域
 
+        # 初始 A(i,j) 对应的 B 区域
         up_boundary = int(inital_pixel[0] - search_dx) if inital_pixel[0] - search_dx > 0 else 0
         down_boundary = int(inital_pixel[0] + 2 * dx + search_dx + 1) if inital_pixel[0] + 2 * dx + search_dx + 1 < B.size(2) else B.size(2)
         left_boundary = int(inital_pixel[1] - search_dy) if inital_pixel[1] - search_dy > 0 else 0
         right_boundary = int(inital_pixel[1] + 2 * dy + search_dy + 1) if inital_pixel[1] + 2 * dy + search_dy + 1 < B.size(3) else B.size(3)
 
+        # pad B 1*512*3*3 -> 1*512*5*5; pad 后 对每个位置 做 conv
         search_box_B = B[:, :, up_boundary:down_boundary, left_boundary:right_boundary]
 
-        # conv 本质：element-wise 乘积，再求和 (参考 2D)
-        # 因为一开始在 C 将所有 feature normalize 为单位向量了；所以可以直接乘积计算余弦距离
-
-        # 使用 patch_A 1*512*3*3 作为卷积核 weight
+        # patch_A 1*512*3*3 作为卷积核 weight
         # 将 search_box_B 从 512 -> 1 维
-        result_B = functional.conv2d(Variable(search_box_B), Variable(patch_A.contiguous())).data
+        result_B = F.conv2d(search_box_B, patch_A.contiguous()).data
         # print(patch_A.shape)  # [1, 512, 3, 3]
         # print(search_box_B.shape)  # [1, 512, 5, 5]
         # print(result_B.shape)  # [1, 1, 3, 3]
 
         # cos distance
         distance = result_B
-        # max val
-        closest_patch_distance = distance.max()  # tensor.max(3) 返回 第3维 最大的数 和 idx
-        # val pos
+        # todo: 可能存在多个 max，返回一个即可
         _, _, max_i, max_j = torch.where(distance == distance.max())
+        if len(max_i) > 1:
+            max_i, max_j = max_i[0], max_j[0]
         # +dx, +dy 转换到 B patch 坐标系
         # +up_boundary, +left_boundary 转换到 B 全图坐标系
         closest_patch_index = [max_i + dx + up_boundary, max_j + dy + left_boundary]
 
         return closest_patch_index
 
-    def warp(self, A_size, B, patch_size, mapping):
+    def warp(self, A_size, B, patch_size, mapping_a_to_b):  # mapping_a_to_b
+        """
+        根据 mapping_a_to_b 将 A 对应 B 的区域 映射到 A 自身的位置
+        """
         assert (B.size() == A_size)
         [dx, dy] = [math.floor(patch_size[0] / 2), math.floor(patch_size[1] / 2)]
-        pad_size = tuple([dy, dy, dx, dx])
-        B_padded = functional.pad(B, pad_size, self.pad_mode).data
+        B_padded = F.pad(B, [dy, dy, dx, dx], self.pad_mode)
+
+        # 保存从 B 映射到的 A 中每个 patch 对应的 B feature
         warped_A = self.Tensor(B_padded.size()).fill_(0.0)
+
         counter = self.Tensor(B_padded.size()).fill_(0.0)
+        patch_cnt = self.Tensor(B_padded.size(0), B_padded.size(1), patch_size[0], patch_size[1]).fill_(1.0)
+
         for i in range(A_size[2]):
             for j in range(A_size[3]):
-                map_ij = mapping[0, :, i, j]
-                warped_A[:, :, i:(i + 2 * dx + 1), j:(j + 2 * dy + 1)] += B_padded[:, :, int(map_ij[0]):(int(map_ij[0]) + 2 * dx + 1),
-                                                                          int(map_ij[1]):(int(map_ij[1]) + 2 * dy + 1)]
-                counter[:, :, i:(i + 2 * dx + 1), j:(j + 2 * dy + 1)] += self.Tensor(B_padded.size(0), B_padded.size(1), patch_size[0], patch_size[1]).fill_(
-                    1.0)
-        return warped_A[:, :, dx:(warped_A.size(2) - dx), dy:(warped_A.size(3) - dy)] / counter[:, :, dx:(warped_A.size(2) - dx), dy:(warped_A.size(3) - dy)]
+                # A region 对应的 B region 添加到 A 中 (i,j) 位置
+                ab_i, ab_j = map(int, mapping_a_to_b[0, :, i, j])
+                # 因为 stride=1, 而 patch_size>1, patch 内部分 pixel 多次加 feature，所以用 counter 平均特征
+                warped_A[:, :, i:(i + 2 * dx + 1), j:(j + 2 * dy + 1)] += \
+                    B_padded[:, :, ab_i:ab_i + 2 * dx + 1, ab_j:ab_j + 2 * dy + 1]
+                counter[:, :, i:(i + 2 * dx + 1), j:(j + 2 * dy + 1)] += patch_cnt
+
+        warped_A = warped_A[:, :, dx:(warped_A.size(2) - dx), dy:(warped_A.size(3) - dy)] / \
+                   counter[:, :, dx:(warped_A.size(2) - dx), dy:(warped_A.size(3) - dy)]
+        return warped_A
 
     def warp_to_mid(self, A_size, B, A, patch_size, mapping):
         assert (B.size() == A_size)
         [dx, dy] = [math.floor(patch_size[0] / 2), math.floor(patch_size[1] / 2)]
         pad_size = tuple([dy, dy, dx, dx])
-        B_padded = functional.pad(B, pad_size, self.pad_mode).data
-        A_padded = functional.pad(A, pad_size, self.pad_mode).data
+        B_padded = F.pad(B, pad_size, self.pad_mode).data
+        A_padded = F.pad(A, pad_size, self.pad_mode).data
         warped_A = self.Tensor(B_padded.size()).fill_(0.0)
         counter = self.Tensor(B_padded.size()).fill_(0.0)
         for i in range(A_size[2]):
@@ -138,17 +156,6 @@ class sparse_semantic_correspondence:
                     1.0)
         return warped_A[:, :, dx:(warped_A.size(2) - dx), dy:(warped_A.size(3) - dy)] / counter[:, :, dx:(warped_A.size(2) - dx), dy:(warped_A.size(3) - dy)]
 
-    def normalize_0_to_1(self, F):
-        assert (F.dim() == 4)
-        max_val = F.max()
-        min_val = F.min()
-        if max_val != min_val:
-            F_normalized = (F - min_val) / (max_val - min_val)
-        else:
-            F_normalized = self.Tensor(F.size()).fill_(0)
-
-        return F_normalized
-
     def mapping_to_image_size(self, mapping, level, original_image_size):
         if level == 1:
             return mapping
@@ -160,93 +167,126 @@ class sparse_semantic_correspondence:
 
     def upsample_mapping(self, mapping, factor=2):
         upsampler = torch.nn.Upsample(scale_factor=factor, mode='nearest')
-        return upsampler(Variable(factor * mapping)).data
+        return upsampler(factor * mapping).data
+
+    def normalize_0_to_1(self, F):
+        assert (F.dim() == 4)
+        max_val = F.max()
+        min_val = F.min()
+        if max_val != min_val:
+            F_normalized = (F - min_val) / (max_val - min_val)
+        else:
+            F_normalized = self.Tensor(F.size()).fill_(0)
+
+        return F_normalized
 
     def get_M(self, F, tau=0.05):
         assert (F.dim() == 4)
-        F_squared_sum = F.pow(2).sum(1, keepdim=True).expand_as(F)
+        F_squared_sum = F.pow(2).sum(1, keepdim=True).pow(0.5)
         F_normalized = self.normalize_0_to_1(F_squared_sum)  # all feature normalize ~ [0,1]
         M = self.Tensor(F_normalized.size())
         M.copy_(torch.ge(F_normalized, tau))  # >= tau
-        # copy_ 将 bool -> int [0,1]
-        # print('M', M.shape)  # [1, 512, 14, 14]
         return M
 
     def identity_map(self, size):
-        """ C=2，存储 grid i,j 坐标，element-wise 组合可以得到 坐标位置
-        tensor([[[[0., 0.],     # i
-                  [1., 1.]],
-
-                 [[0., 1.],     # j
-                  [0., 1.]]]], device='cuda:0')
+        """
+        C=2，存储 grid i,j 坐标，element-wise 组合可以得到 坐标位置
+        :param size: feature tensor size, 1,512,14,14
+        :return:
         """
         idnty_map = self.Tensor(size[0], 2, size[2], size[3])
-        idnty_map[0, 0, :, :].copy_(torch.arange(0, size[2]).repeat(size[3], 1).transpose(0, 1))
-        idnty_map[0, 1, :, :].copy_(torch.arange(0, size[3]).repeat(size[2], 1))
+        # size[0] = 1
+        idnty_map[0, 0, :, :].copy_(
+            torch.arange(0, size[2]).repeat(size[3], 1).transpose(0, 1)  # arange(size[2]), i; (W,H)->(H,W)
+        )
+        idnty_map[0, 1, :, :].copy_(
+            torch.arange(0, size[3]).repeat(size[2], 1)  # arange(size[3]), j
+        )
         return idnty_map
 
-    def spatial_distance(self, point_A, point_B):
-        return math.pow((point_A - point_B).pow(2).sum(), 0.5)
-
-    def find_neural_best_buddies(self, correspondence, F_A, F_Am, F_Bm, F_B, patch_size,
+    def find_neural_best_buddies(self, correspondence, F_A, F_B, F_Am, F_Bm, patch_size,
                                  initial_map_a_to_b, initial_map_b_to_a, search_box_radius,
-                                 tau, top, deepest_level=False):
+                                 deepest_level=False):
         """
-        F_A, F_B    model features
-        F_Am, F_Bm  clone features
-        patch_size  对应 level 的 region patch 大小
-
+        :param correspondence: 对应点 来自 上层
+        :param F_A: model features
+        :param F_B:
+        :param F_Am: clone features
+        :param F_Bm:
+        :param patch_size: 对应 level 的 region patch 大小
+        :param initial_map_a_to_b: 初始 i,j 坐标位, find_mapping 会更新得到 a_to_b, b_to_a
+        :param initial_map_b_to_a:
+        :param search_box_radius:
+        :param deepest_level: 深层，控制
+        :return:
+            refined_correspondence
+            a_to_b
+            b_to_a
         """
-        assert (F_A.size() == F_Bm.size())
-        assert (F_Am.size() == F_B.size())
-
-        # normalize feature, 均方根 C
+        # 归一化: feature vector -> 单位向量
+        # 方便后面计算 feature vector 间 cos similarity
         F_Am_normalized = FM.normalize_per_pix(F_Am)
         F_Bm_normalized = FM.normalize_per_pix(F_Bm)
 
-        # 发现对应，更新 identity_map 坐标位
+        # NN, d_max
         a_to_b = self.find_mapping(F_Am_normalized, F_Bm_normalized, patch_size, initial_map_a_to_b, search_box_radius)
         b_to_a = self.find_mapping(F_Bm_normalized, F_Am_normalized, patch_size, initial_map_b_to_a, search_box_radius)
 
-        if deepest_level == True:
+        if deepest_level:
+            # mutual NN, correspondence
+            # return [[A_pts], [B_pts]] NBBs
             refined_correspondence = self.find_best_buddies(a_to_b, b_to_a)
-            # return [[A_pts], [B_pts]]
+            # cal rank activations
+            # return [[A_pts], [B_pts], [rank_activations]]
             refined_correspondence = self.calculate_activations(refined_correspondence, F_A, F_B)
-            # return [[A_pts], [B_pts], [AB_avgs]]
         else:
             refined_correspondence = correspondence
             for i in range(len(correspondence[0]) - 1, -1, -1):
-                [top_left_1, bottom_right_1] = self.extract_receptive_field(correspondence[0][i][0], correspondence[0][i][1], search_box_radius,
-                                                                            [a_to_b.size(2), a_to_b.size(3)])
-                [top_left_2, bottom_right_2] = self.extract_receptive_field(correspondence[1][i][0], correspondence[1][i][1], search_box_radius,
-                                                                            [a_to_b.size(2), a_to_b.size(3)])
+                top_left_1, bottom_right_1 = self.extract_receptive_field(correspondence[0][i][0], correspondence[0][i][1], search_box_radius,
+                                                                          [a_to_b.size(2), a_to_b.size(3)])
+                top_left_2, bottom_right_2 = self.extract_receptive_field(correspondence[1][i][0], correspondence[1][i][1], search_box_radius,
+                                                                          [a_to_b.size(2), a_to_b.size(3)])
                 refined_correspondence_i = self.find_best_buddies(a_to_b, b_to_a, top_left_1, bottom_right_1, top_left_2, bottom_right_2)
                 refined_correspondence_i = self.calculate_activations(refined_correspondence_i, F_A, F_B)
                 refined_correspondence = self.replace_refined_correspondence(refined_correspondence, refined_correspondence_i, i)
 
-        return [refined_correspondence, a_to_b, b_to_a]
+        return refined_correspondence, a_to_b, b_to_a
 
     def find_best_buddies(self, a_to_b, b_to_a,
                           top_left_1=[0, 0],
                           bottom_right_1=[float('inf'), float('inf')],
                           top_left_2=[0, 0],
                           bottom_right_2=[float('inf'), float('inf')]):
+        """
+        :param a_to_b: A/B patch 内 i,j 映射
+        :param b_to_a:
+        :param top_left_1: # 后面四组坐标位; 中间层特征要使用; 表示1个 patch 范围
+        :param bottom_right_1:
+        :param top_left_2:
+        :param bottom_right_2:
+        :return:
+        """
         assert (a_to_b.size() == b_to_a.size())
         correspondence = [[], []]  # A pts, B pts
         number_of_cycle_consistencies = 0
 
         for i in range(top_left_1[0], min(bottom_right_1[0], a_to_b.size(2))):
             for j in range(top_left_1[1], min(bottom_right_1[1], a_to_b.size(3))):
-                # map_ij: a 对应 b 中的点 的位置
-                map_ij = a_to_b[0, :, i, j].cpu().numpy()  # Should be improved (slow in cuda)
-                # 对应点之间 distance
-                # b 使用 map_ij 得到的 a 中对应点的 位置；恰好与 [i,j] d=0；表示两边互相对应上 双保险
-                d = self.spatial_distance(b_to_a[0, :, int(map_ij[0]), int(map_ij[1])], self.Tensor([i, j]))
-                if d == 0:
-                    if top_left_2[0] <= int(map_ij[0]) < bottom_right_2[0] and top_left_2[1] <= int(map_ij[1]) < bottom_right_2[1]:
-                        correspondence[0].append([i, j])
-                        correspondence[1].append([int(map_ij[0]), int(map_ij[1])])
+                # 通过 A(i,j) -> a_to_b(i,j) A 对应于 B 的 i,j -> b_to_a(map)
+                ab_i, ab_j = map(int, a_to_b[0, :, i, j])  # A->B
+                aba_i, aba_j = b_to_a[0, :, ab_i, ab_j]  # A->B->A
+
+                d = FM.spatial_distance(  # 判断二点 是否循环对应
+                    point_A=self.Tensor([i, j]),
+                    point_B=self.Tensor([aba_i, aba_j])
+                )
+                if d == 0:  # 满足循环对应, long 型 tensor 不能直接和 float 比较
+                    if top_left_2[0] <= ab_i < bottom_right_2[0] and top_left_2[1] <= ab_j < bottom_right_2[1]:
+                        correspondence[0].append([i, j])  # A 中 i,j 对应
+                        correspondence[1].append([ab_i, ab_j])  # B 中 ab_i,ab_j
                         number_of_cycle_consistencies += 1
+
+        print('number_of_cycle_consistencies:', number_of_cycle_consistencies)
 
         return correspondence
 
@@ -275,19 +315,22 @@ class sparse_semantic_correspondence:
         :param correspondence: [[A_pts], [B_pts]]
         :param F_A: feature map
         :param F_B:
-        :return:
+        :return: response_correspondence
+            [[A_pts], [B_pts]] + [rank_activations]
         """
-        # C 维 l2 归一化，再 min_max normal to [0, 1]
-        response_A = FM.stretch_tensor_0_to_1(FM.response(F_A))  # 归一化到 0,1
-        response_B = FM.stretch_tensor_0_to_1(FM.response(F_B))
+        # normalized featrue map
+        # FM.response: l2 and min_max norm F_A, F_B -> [0, 1]
+        self.H_A = FM.FA_to_HA_norm(F_A)
+        self.H_B = FM.FA_to_HA_norm(F_B)
+
         response_correspondence = correspondence
         response_correspondence.append([])
         for i in range(len(correspondence[0])):
-            # pt in A
-            response_A_i = response_A[0, 0, correspondence[0][i][0], correspondence[0][i][1]]
-            # pt in B
-            response_B_i = response_B[0, 0, correspondence[1][i][0], correspondence[1][i][1]]
-            # 使用 mean 增强
+            # pts and activations
+            pt_A, pt_B = correspondence[0][i], correspondence[1][i]
+            response_A_i = self.H_A[0, 0, pt_A[0], pt_A[1]]
+            response_B_i = self.H_B[0, 0, pt_B[0], pt_B[1]]
+            # rank, add for each layer
             correspondence_avg_response_i = (response_A_i + response_B_i) * 0.5
             response_correspondence[2].append(correspondence_avg_response_i)
         return response_correspondence
@@ -301,31 +344,37 @@ class sparse_semantic_correspondence:
         if len(correspondence[0]) > 0:
             [sorted_correspondence, ind] = correspondence_avg_response.sort(dim=0, descending=True)
             for i in range(min(top, len(correspondence[0]))):
-                # if self.get_M(F_A, tau=tau)[0,0,correspondence[0][ind[i]][0],correspondence[0][ind[i]][1]] == 1 and self.get_M(F_B, tau=tau)[0,0,correspondence[1][ind[i]][0],correspondence[1][ind[i]][1]] == 1:
                 top_response_correspondence[0].append(correspondence[0][ind[i]])
                 top_response_correspondence[1].append(correspondence[1][ind[i]])
                 top_response_correspondence[2].append(sorted_correspondence[i])
 
         return top_response_correspondence
 
-    def threshold_response_correspondence(self, correspondence, F_A, F_B, th):
+    def threshold_response_correspondence(self, correspondence, H_A, H_B, th):
         """
-        :param correspondence: [[A_pts], [B_pts], [AB_avgs]]
-        :param F_A: B,C,H,W
-        :param F_B:
+        :param correspondence: [[A_pts], [B_pts], [rank_activation]]
+        :param H_A: normalized activation map
+        :param H_B:
         :param th: tau=0.05 response threshold
         :return:
         """
-        M_A = self.get_M(F_A, tau=th)  # 取出 >= tau 的 feature，排除部分解
-        M_Bt = self.get_M(F_B, tau=th)  # [1, 512, 14, 14]
+        # M_A = self.get_M(H_A, tau=th)  # 取出 >= tau 的 feature，排除部分解
+        # M_Bt = self.get_M(H_B, tau=th)
+
+        # mask
+        M_A = H_A.ge(th)
+        M_B = H_B.ge(th)
+        # print('A mask:', M_A.sum())  # > thre 较多，但是二者位置能对应的的不多
+        # print('B mask:', M_B.sum())
+
         high_correspondence = [[], [], []]
 
         # 遍历 对应点
         for i in range(len(correspondence[0])):
             M_A_i = M_A[0, 0, correspondence[0][i][0], correspondence[0][i][1]]
-            M_Bt_i = M_Bt[0, 0, correspondence[1][i][0], correspondence[1][i][1]]
+            M_B_i = M_B[0, 0, correspondence[1][i][0], correspondence[1][i][1]]
             # 只判断 第0维 feature 是否 > 0.05?
-            if M_A_i == 1 and M_Bt_i == 1:
+            if M_A_i and M_B_i:
                 high_correspondence[0].append(correspondence[0][i])
                 high_correspondence[1].append(correspondence[1][i])
                 high_correspondence[2].append(correspondence[2][i])
@@ -374,13 +423,9 @@ class sparse_semantic_correspondence:
         if corr_1[0] == corr_2[0] and corr_1[1] == corr_2[1]:
             return True
 
-    def response(self, F):
-        response = F.pow(2).sum(1, keepdim=True)
-        return response
-
     def scale_correspondence(self, correspondence, level):
         scaled_correspondence = [[], [], []]
-        scale_factor = int(math.pow(2, level - 1))
+        scale_factor = int(math.pow(2, level - 1))  # todo: 放大因子?
         for i in range(len(correspondence[0])):
             scaled_correspondence[0].append([scale_factor * correspondence[0][i][0], scale_factor * correspondence[0][i][1]])
             scaled_correspondence[1].append([scale_factor * correspondence[1][i][0], scale_factor * correspondence[1][i][1]])
@@ -393,33 +438,52 @@ class sparse_semantic_correspondence:
         self.save_points_as_txt(correspondence[1], 'correspondence_Bt' + name)
 
     def save_points_as_txt(self, points, name):
-        util.mkdirs(self.save_dir)
         file_name = os.path.join(self.save_dir, name + '.txt')
         with open(file_name, 'wt') as opt_file:
             for i in range(len(points)):
                 opt_file.write('%i, %i\n' % (points[i][0], points[i][1]))
 
     def top_k_in_clusters(self, correspondence, k):
+        """
+        :param correspondence: [[A_pts], [B_pts], [rank_activation >= tau]]
+        :param k:
+        :return: top_cluster_correspondence: [[A_pts], [B_pts], [rank_activation >= tau]]
+        """
         if k > len(correspondence[0]):
             return correspondence
 
         correspondence_R_4 = []
         for i in range(len(correspondence[0])):
-            correspondence_R_4.append([correspondence[0][i][0], correspondence[0][i][1], correspondence[1][i][0], correspondence[1][i][1]])
+            correspondence_R_4.append([  # 聚类特征向量 dim=4, 由2组对应的空间坐标组成
+                correspondence[0][i][0],
+                correspondence[0][i][1],
+                correspondence[1][i][0],
+                correspondence[1][i][1]
+            ])
 
         top_cluster_correspondence = [[], [], []]
         print("Calculating K-means...")
         kmeans = KMeans(n_clusters=k, random_state=0).fit(correspondence_R_4)
+        labels = kmeans.labels_
+
+        # 取每个簇 i 下的极值 idx
+        cluster = {
+            i: {'max_activation': 0, 'max_activation_idx': -1}
+            for i in range(k)
+        }
+
+        for j in range(len(correspondence[0])):
+            if correspondence[2][j] > cluster[labels[j]]['max_activation']:
+                cluster[labels[j]]['max_activation'] = correspondence[2][j]
+                cluster[labels[j]]['max_activation_idx'] = j
+
+        pprint(cluster)
+
         for i in range(k):
-            max_response = 0
-            max_response_index = len(correspondence[0])
-            for j in range(len(correspondence[0])):
-                if kmeans.labels_[j] == i and correspondence[2][j] > max_response:
-                    max_response = correspondence[2][j]
-                    max_response_index = j
-            top_cluster_correspondence[0].append(correspondence[0][max_response_index])
-            top_cluster_correspondence[1].append(correspondence[1][max_response_index])
-            top_cluster_correspondence[2].append(correspondence[2][max_response_index])
+            max_activation_idx = cluster[i]['max_activation_idx']
+            top_cluster_correspondence[0].append(correspondence[0][max_activation_idx])
+            top_cluster_correspondence[1].append(correspondence[1][max_activation_idx])
+            top_cluster_correspondence[2].append(correspondence[2][max_activation_idx])
 
         return top_cluster_correspondence
 
@@ -434,19 +498,20 @@ class sparse_semantic_correspondence:
 
     def transfer_style_local(self, F_A, F_B, patch_size, image_width, mapping_a_to_b, mapping_b_to_a, L):
         """
-        :param F_A:
-        :param F_B:
-        :param patch_size:
-        :param image_width:
-        :param mapping_a_to_b:
-        :param mapping_b_to_a:
-        :param L:
-        :return:
+        F_A, F_B 深层特征图
+        mapping_a_to_b, mapping_b_to_a 从 F_B, F_A 得到映射特征图
+           FL_1A, FL_1B 浅层特征图
+         + RL_1B, RL_1A 映射特征图; 从 wraped L 层 学到 L-1 层
+           取均值，得到 common local feature
         """
-        F_B_warped = self.warp(F_A.size(), F_B, patch_size, mapping_a_to_b)
-        F_A_warped = self.warp(F_B.size(), F_A, patch_size, mapping_b_to_a)
-        RL_1B = self.model.deconve(F_B_warped, image_width, L, L - 1, print_errors=False).data
-        RL_1A = self.model.deconve(F_A_warped, image_width, L, L - 1, print_errors=False).data
+        # B->A
+        F_B_warped = self.warp(F_A.size(), F_B, patch_size, mapping_a_to_b)  # B 特征 wrap 到 A(i,j) 位置
+        F_A_warped = self.warp(F_B.size(), F_A, patch_size, mapping_b_to_a)  # A 特征 wrap 到 B(i,j) 位置
+
+        # Note: freeze 中间 layer [L-1,L]；
+        # 更新对象：和 L-1 层 feature 同 size 的 feature; 使模型输出 和 warped feature 相似
+        RL_1B = self.model.deconv(F_B_warped, image_width, L, L - 1)
+        RL_1A = self.model.deconv(F_A_warped, image_width, L, L - 1)
 
         # last layer feature 上一个 level 特征
         self.model.set_input(self.A)
@@ -454,11 +519,12 @@ class sparse_semantic_correspondence:
         self.model.set_input(self.B)
         FL_1B = self.model.forward(level=L - 1).data
 
-        # mean feature; 上采样 再和 上一层求均值
-        FL_1Am = (FL_1A + RL_1B) * 0.5
+        # 浅层 feature + 深层 feature 映射坐标位
+        FL_1Am = (FL_1A + RL_1B) * 0.5  # unnormalized
         FL_1Bm = (FL_1B + RL_1A) * 0.5
-        initial_map_a_to_b = self.upsample_mapping(mapping_a_to_b)  # 上采样 mapping
+        initial_map_a_to_b = self.upsample_mapping(mapping_a_to_b)  # nearest 上采样 mapping, 在对应区域 coarse-to-fine
         initial_map_b_to_a = self.upsample_mapping(mapping_b_to_a)
+
         return [FL_1A, FL_1B, FL_1Am, FL_1Bm, initial_map_a_to_b, initial_map_b_to_a]
 
     def finalize_correspondence(self, correspondence, image_width, L):
@@ -474,7 +540,6 @@ class sparse_semantic_correspondence:
         assert (A.size() == B.size())
         image_width = A.size(3)
         print("Saving original images...")
-        util.mkdir(self.save_dir)
         util.save_final_image(A, 'original_A', self.save_dir)
         util.save_final_image(B, 'original_B', self.save_dir)
 
@@ -484,6 +549,8 @@ class sparse_semantic_correspondence:
         print("Starting algorithm...")
         # coarse-to-fine
         L_start = 5
+
+        # level5: 获得 A/B 特征图
         self.model.set_input(self.A)
         F_A = self.model.forward(level=L_start).data  # 相当于 detach 出变量，没有 grad_fn
         self.model.set_input(self.B)
@@ -491,20 +558,14 @@ class sparse_semantic_correspondence:
         F_Am = F_A.clone()
         F_Bm = F_B.clone()
 
-        # grid (i,j) 坐标位置
-        initial_map_a_to_b = self.identity_map(F_B.size())  # 14*14
+        # 1.初始坐标位 a_to_b, b_to_a
+        initial_map_a_to_b = self.identity_map(F_B.size())  # 1,512,14,14
         initial_map_b_to_a = initial_map_a_to_b.clone()
 
-        """
-                    img size = [224, 112, 56, 28, 14]
-        self.patch_size_list = [[5, 5], [5, 5], [3, 3], [3, 3], [3, 3]]
-        self.search_box_radius_list = [3, 3, 2, 2, 2]
-        self.draw_radius = [2, 2, 2, 4, 8]
-        """
         # L: deepest to shallowest
         for L in range(L_start, self.L_final - 1, -1):  # 5, self.L_final = 2 if fast else 1
             patch_size = self.patch_size_list[L - 1]  # [3,3]
-            search_box_radius = self.search_box_radius_list[L - 1]  # 2
+            search_box_radius = self.search_box_radius_list[L - 1]  # 2, (path+1)/2
             draw_radius = self.draw_radius[L - 1]  # 8
 
             if L == L_start:
@@ -512,31 +573,48 @@ class sparse_semantic_correspondence:
                 correspondence = []  # begin
             else:
                 deepest_level = False
+                # correspondence: 中间层，基于上轮(+1层) correspondence 寻找 search region
 
             print("Finding best-buddies for the " + str(L) + "-th level")
-            [correspondence, mapping_a_to_b, mapping_b_to_a] = self.find_neural_best_buddies(
-                correspondence, F_A, F_Am, F_Bm, F_B, patch_size,
-                initial_map_a_to_b, initial_map_b_to_a, search_box_radius,
-                self.tau, self.k_per_level, deepest_level
-            )  # return [[A_pts], [B_pts], [AB_avgs]], mapping_a_to_b, mapping_b_to_a 坐标位
 
-            correspondence = self.threshold_response_correspondence(correspondence, F_A, F_B, self.tau)
+            # 2.对应后坐标位 和 NBBs
+            # correspondence: [[A_pts], [B_pts], [rank_activation]]
+            # mapping_a_to_b, mapping_b_to_a; 坐标位
+            correspondence, mapping_a_to_b, mapping_b_to_a = self.find_neural_best_buddies(
+                correspondence, F_A, F_B, F_Am, F_Bm, patch_size,
+                initial_map_a_to_b, initial_map_b_to_a,
+                search_box_radius, deepest_level
+            )
+
+            # 3.tau 过滤 H(p)
+            # correspondence: [[A_pts], [B_pts], [rank_activation >= tau]]
+            correspondence = self.threshold_response_correspondence(correspondence,
+                                                                    self.H_A, self.H_B,  # l2 and min_max norm feature
+                                                                    self.tau)  # 可以不用手工设置，保留一些统计结果?
+            print(f'thre >= {self.tau}:', len(correspondence[0]))
+
+            # 设置 k_per_level, 由深到浅的每一层 都执行 k-means 选择 NBBs; 减少计算量
             if self.k_per_level < float('inf'):
                 correspondence = self.top_k_in_clusters(correspondence, int(self.k_per_level))
+                print(f'cluster k({self.k_per_level}):', len(correspondence[0]))
 
+            # scale_correspondence 坐标位，在原图画出对应
             if L > self.L_final:
                 print("Drawing correspondence...")
                 scaled_correspondence = self.scale_correspondence(correspondence, L)
                 draw.draw_correspondence(self.A, self.B, scaled_correspondence, draw_radius, self.save_dir, L)
 
-            [F_A, F_B, F_Am, F_Bm, initial_map_a_to_b, initial_map_b_to_a] = self.transfer_style_local(
-                F_A, F_B, patch_size, image_width, mapping_a_to_b, mapping_b_to_a, L)
+            F_A, F_B, F_Am, F_Bm, initial_map_a_to_b, initial_map_b_to_a = self.transfer_style_local(
+                F_A, F_B, patch_size, image_width, mapping_a_to_b, mapping_b_to_a, L
+            )
 
         filtered_correspondence = self.finalize_correspondence(correspondence, image_width, self.L_final)
         draw.draw_correspondence(self.A, self.B, filtered_correspondence, self.draw_radius[self.L_final - 1], self.save_dir)
         self.save_correspondence_as_txt(filtered_correspondence)
+
+        # After L=1, chose top K by k_final
         top_k_correspondence = self.top_k_in_clusters(filtered_correspondence, self.k_final)
-        draw.draw_correspondence(self.A, self.B, top_k_correspondence, self.draw_radius[self.L_final - 1], self.save_dir, name='_top_' + str(self.k_final))
+        draw.draw_correspondence(self.A, self.B, top_k_correspondence, self.draw_radius[self.L_final - 1], self.save_dir, self.k_final)
         self.save_correspondence_as_txt(top_k_correspondence, name='_top_' + str(self.k_final))
 
         return scaled_correspondence
